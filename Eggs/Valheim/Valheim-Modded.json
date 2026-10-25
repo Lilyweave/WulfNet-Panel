@@ -1,0 +1,162 @@
+{
+  "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-10-24T00:00:00+00:00",
+  "name": "Valheim (Modded - r2modman Profile) - BETA",
+  "author": "sarah@example.com",
+  "description": "Valheim dedicated server with BepInEx that installs its mods from an r2modman/Thunderstore profile code.",
+  "features": null,
+  "docker_images": {
+    "ghcr.io/Lilyweave/WulfNet-Panel/Docker Images/SteamCMD:Debian": "ghcr.io/Lilyweave/WulfNet-Panel/Docker Images/SteamCMD:Debian"
+  },
+  "file_denylist": [],
+  "startup": "./start_server.sh {{SERVER_PORT}}",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\": \"Game server connected\"}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\n# Modded Valheim installer: SteamCMD dedicated server + BepInEx + r2modman profile sync\nexport DEBIAN_FRONTEND=noninteractive\nSERVER=/mnt/server\n\nfor tool in curl unzip base64 awk sha256sum; do\n  if ! command -v \"$tool\" >/dev/null 2>&1; then\n    apt-get update -qq && apt-get install -y -qq curl unzip coreutils gawk\n    break\n  fi\ndone\n\nmkdir -p \"$SERVER/steamcmd\" \"$SERVER/steam\" \"$SERVER/saves\" \"$SERVER/.steam/sdk32\" \"$SERVER/.steam/sdk64\"\n\n## ---- 1. Valheim dedicated server (app 896660) ----\ncd /tmp\ncurl -sSL -o steamcmd.tar.gz https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz\ntar -xzf steamcmd.tar.gz -C \"$SERVER/steamcmd\"\ncd \"$SERVER/steamcmd\"\nexport HOME=\"$SERVER\"\nfor attempt in 1 2 3; do\n  ./steamcmd.sh +force_install_dir \"$SERVER\" +login anonymous +app_update 896660 validate +quit\n  [ -f \"$SERVER/valheim_server.x86_64\" ] && break\n  echo \"[install] Valheim server binary not found after attempt $attempt, retrying...\"\ndone\nif [ ! -f \"$SERVER/valheim_server.x86_64\" ]; then\n  echo \"[install] ERROR: SteamCMD did not download the Valheim server. Check the output above.\"\n  exit 1\nfi\ncp -v linux32/steamclient.so \"$SERVER/.steam/sdk32/steamclient.so\"\ncp -v linux64/steamclient.so \"$SERVER/.steam/sdk64/steamclient.so\"\n\n## ---- 1b. Bundle unzip for the runtime image (it may not ship one) ----\nmkdir -p \"$SERVER/.tools/lib\"\nUNZIP_BIN=$(command -v unzip)\ncp -L \"$UNZIP_BIN\" \"$SERVER/.tools/unzip\"\nldd \"$UNZIP_BIN\" | awk '/=> \\// {print $3}' | grep -Ev '/(libc|libm|libdl|libpthread)\\.so' \\\n  | while read -r lib; do cp -L \"$lib\" \"$SERVER/.tools/lib/\"; done\nchmod +x \"$SERVER/.tools/unzip\"\n\n## ---- 2. Mod sync script (runs now, and on every server start if AUTO_UPDATE_MODS=1) ----\ncat > \"$SERVER/sync_mods.sh\" <<'SYNC_EOF'\n#!/bin/bash\n# Syncs BepInEx mods from an r2modman profile code.\n#   PROFILE_CODE        r2modman profile code (required)\n#   EXCLUDE_MODS        comma-separated Author-Name list to skip\n#   LATEST_MOD_VERSIONS 1 = use newest Thunderstore version of each mod (BepInEx pack stays pinned)\nROOT=\"${ROOT:-$(cd \"$(dirname \"$0\")\" && pwd)}\"\nSTATE=\"$ROOT/.r2sync\"\nWORK=\"$STATE/work\"\nPACK=\"denikson-BepInExPack_Valheim\"\nmkdir -p \"$STATE\"\n\nif [ -z \"${PROFILE_CODE:-}\" ]; then\n  echo \"[sync] No PROFILE_CODE set, skipping mods.\"\n  exit 0\nfi\nfor tool in curl base64 awk sha256sum; do\n  command -v \"$tool\" >/dev/null 2>&1 || { echo \"[sync] '$tool' is not available in this image, skipping mod sync.\"; exit 1; }\ndone\nUNZIP=unzip\nif ! command -v unzip >/dev/null 2>&1; then\n  UNZIP=\"$ROOT/.tools/unzip\"\nfi\n# unzip exits 1 for harmless warnings (e.g. Windows-style backslash paths); treat that as success\ndo_unzip() {\n  LD_LIBRARY_PATH=\"$ROOT/.tools/lib:${LD_LIBRARY_PATH:-}\" \"$UNZIP\" \"$@\"\n  local rc=$?\n  [ \"$rc\" -le 1 ] && return 0\n  return \"$rc\"\n}\ndo_unzip -v >/dev/null 2>&1 || { echo \"[sync] No working unzip (system or bundled in .tools/), skipping mod sync.\"; exit 1; }\n\nKEY=$(printf '%s|%s' \"$PROFILE_CODE\" \"${EXCLUDE_MODS:-}\" | sha256sum | cut -d' ' -f1)\nif [ \"${LATEST_MOD_VERSIONS:-0}\" != \"1\" ] && [ -f \"$STATE/profile.key\" ] && [ \"$(cat \"$STATE/profile.key\")\" = \"$KEY\" ]; then\n  echo \"[sync] Profile unchanged, mods are up to date.\"\n  exit 0\nfi\n\nrm -rf \"$WORK\"; mkdir -p \"$WORK/profile\" \"$WORK/ex\"\ncd \"$WORK\" || exit 1\n\necho \"[sync] Fetching profile ${PROFILE_CODE} from Thunderstore...\"\ncurl -fsSL \"https://thunderstore.io/api/experimental/legacyprofile/get/${PROFILE_CODE}/\" -o raw.txt \\\n  || { echo \"[sync] ERROR: could not fetch profile code.\"; exit 1; }\nhead -n1 raw.txt | grep -q '^#r2modman' || { echo \"[sync] ERROR: unexpected response from Thunderstore.\"; exit 1; }\ntail -n +2 raw.txt | tr -d '\\r\\n ' | base64 -d > profile.zip || { echo \"[sync] ERROR: could not decode profile.\"; exit 1; }\ndo_unzip -q -o profile.zip -d profile\n[ -f profile/export.r2x ] || { echo \"[sync] ERROR: export.r2x missing from profile.\"; exit 1; }\n\n# export.r2x -> \"Author-Name version\" lines, skipping disabled mods\ntr -d '\\r' < profile/export.r2x | awk '\n  function flush() { if (name != \"\" && en != \"false\") print name, maj \".\" min \".\" pat }\n  /^[[:space:]]*- name:/ { flush(); name=$3; gsub(/[\"\\047]/, \"\", name); en=\"true\"; maj=0; min=0; pat=0 }\n  /^[[:space:]]+major:/  { maj=$2 }\n  /^[[:space:]]+minor:/  { min=$2 }\n  /^[[:space:]]+patch:/  { pat=$2 }\n  /^[[:space:]]+enabled:/ { en=$2 }\n  END { flush() }\n' > mods.txt\n\nEXCLUDE=$(echo \"${EXCLUDE_MODS:-}\" | tr 'A-Z' 'a-z' | tr -d ' ')\ntouch \"$STATE/installed.txt\"\n: > final.txt\nFAILS=0\n\nremove_mod() {\n  rm -rf \"$ROOT/BepInEx/plugins/$1\" \"$ROOT/BepInEx/patchers/$1\" \"$ROOT/BepInEx/monomod/$1\" \"$ROOT/BepInEx/core/$1\"\n}\n\nlatest_version() {  # $1=author $2=pkg\n  curl -fsSL \"https://thunderstore.io/api/experimental/package/$1/$2/\" 2>/dev/null | tr -d '\\n' \\\n    | grep -o '\"latest\":{[^}]*}' | grep -o '\"version_number\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4\n}\n\ninstall_mod() {  # $1=full name, extracted in ./ex\n  local full=\"$1\" P item b\n  if [ \"$full\" = \"$PACK\" ]; then\n    if [ -d ex/BepInExPack_Valheim ]; then\n      cp -r ex/BepInExPack_Valheim/. \"$ROOT/\" || return 1\n    elif [ -d ex/BepInEx ]; then\n      cp -r ex/. \"$ROOT/\" || return 1\n    else\n      echo \"[sync] ERROR: unexpected BepInExPack layout:\"; ls ex\n      return 1\n    fi\n    return 0\n  fi\n  remove_mod \"$full\"\n  if [ -d ex/BepInEx ]; then\n    mkdir -p \"$ROOT/BepInEx\"\n    cp -r ex/BepInEx/. \"$ROOT/BepInEx/\"\n    return\n  fi\n  P=\"$ROOT/BepInEx/plugins/$full\"\n  mkdir -p \"$P\"\n  shopt -s dotglob nullglob\n  for item in ex/*; do\n    b=$(basename \"$item\")\n    case \"$b\" in\n      patchers|monomod|core)\n        mkdir -p \"$ROOT/BepInEx/$b/$full\"\n        cp -r \"$item\"/. \"$ROOT/BepInEx/$b/$full/\" ;;\n      config)\n        mkdir -p \"$ROOT/BepInEx/config\"\n        cp -r \"$item\"/. \"$ROOT/BepInEx/config/\" ;;\n      plugins)\n        cp -r \"$item\"/. \"$P/\" ;;\n      icon.png|README.md|CHANGELOG.md|manifest.json|LICENSE|LICENSE.md) ;;\n      *)\n        cp -r \"$item\" \"$P/\" ;;\n    esac\n  done\n  shopt -u dotglob nullglob\n}\n\nwhile read -r full ver; do\n  [ -z \"$full\" ] && continue\n  lower=$(echo \"$full\" | tr 'A-Z' 'a-z')\n  if [ -n \"$EXCLUDE\" ] && echo \",$EXCLUDE,\" | grep -q \",$lower,\"; then\n    echo \"[sync] Skipping excluded mod: $full\"\n    continue\n  fi\n  author=\"${full%%-*}\"; pkg=\"${full#*-}\"\n\n  if [ \"${LATEST_MOD_VERSIONS:-0}\" = \"1\" ] && [ \"$full\" != \"$PACK\" ]; then\n    lv=$(latest_version \"$author\" \"$pkg\")\n    [ -n \"$lv\" ] && ver=\"$lv\" || echo \"[sync] Could not look up latest for $full, using profile version $ver\"\n  fi\n\n  old=$(awk -v n=\"$full\" '$1==n {print $2}' \"$STATE/installed.txt\")\n  if [ \"$old\" = \"$ver\" ]; then\n    echo \"$full $ver\" >> final.txt\n    continue\n  fi\n\n  [ -n \"$old\" ] && echo \"[sync] Updating $full $old -> $ver\" || echo \"[sync] Installing $full $ver\"\n  rm -rf ex mod.zip; mkdir ex\n  if curl -fsSL -o mod.zip \"https://thunderstore.io/package/download/${author}/${pkg}/${ver}/\" && do_unzip -q -o mod.zip -d ex && install_mod \"$full\"; then\n    echo \"$full $ver\" >> final.txt\n  else\n    FAILS=$((FAILS+1))\n    echo \"[sync] WARNING: failed to fetch $full $ver, keeping any existing version.\"\n    [ -n \"$old\" ] && echo \"$full $old\" >> final.txt\n  fi\ndone < mods.txt\n\n# Remove mods that were dropped from the profile (or newly excluded)\nwhile read -r full _; do\n  [ -z \"$full\" ] && continue\n  if ! grep -q \"^$full \" final.txt; then\n    echo \"[sync] Removing $full\"\n    remove_mod \"$full\"\n  fi\ndone < \"$STATE/installed.txt\"\n\nif [ ! -f \"$ROOT/BepInEx/core/BepInEx.Preloader.dll\" ]; then\n  echo \"[sync] ERROR: BepInEx not found. The profile must include $PACK.\"\n  exit 1\nfi\n\n# Profile config files are applied only when the profile code / exclusions changed,\n# so edits made in the panel survive normal restarts.\nif [ ! -f \"$STATE/config.key\" ] || [ \"$(cat \"$STATE/config.key\")\" != \"$KEY\" ]; then\n  echo \"[sync] Applying profile config files.\"\n  rm -f profile/export.r2x\n  cp -r profile/. \"$ROOT/\"\n  echo \"$KEY\" > \"$STATE/config.key\"\nfi\n\ncp final.txt \"$STATE/installed.txt\"\ncd \"$ROOT\" && rm -rf \"$WORK\"\nif [ \"$FAILS\" -eq 0 ]; then\n  echo \"$KEY\" > \"$STATE/profile.key\"\n  echo \"[sync] Mods synced.\"\nelse\n  rm -f \"$STATE/profile.key\"\n  echo \"[sync] WARNING: $FAILS mod(s) failed to download. They will be retried on the next start.\"\nfi\nSYNC_EOF\nchmod +x \"$SERVER/sync_mods.sh\"\n\n## ---- 3. Launcher (BepInEx via Doorstop) ----\ncat > \"$SERVER/start_server.sh\" <<'EOF'\n#!/bin/bash\ncd \"$(dirname \"$0\")\"\nROOT=\"$PWD\"\n\nif [ \"${AUTO_UPDATE_MODS:-1}\" = \"1\" ]; then\n  bash ./sync_mods.sh || echo \"[sync] Mod sync failed, starting with the mods already installed.\"\nfi\n\n# ---- BepInEx / Doorstop environment ----\nif [ -f BepInEx/core/BepInEx.Preloader.dll ] && [ -f doorstop_libs/libdoorstop_x64.so ]; then\n  if [ -f start_server_bepinex.sh ]; then\n    # Take the exact settings from the pack's own launcher so they always match its version\n    eval \"$(grep -E '^[[:space:]]*export[[:space:]]' start_server_bepinex.sh)\"\n    echo \"[launch] BepInEx enabled (settings from start_server_bepinex.sh)\"\n  else\n    export DOORSTOP_ENABLE=TRUE\n    export DOORSTOP_INVOKE_DLL_PATH=\"$ROOT/BepInEx/core/BepInEx.Preloader.dll\"\n    export DOORSTOP_CORLIB_OVERRIDE_PATH=\"$ROOT/unstripped_corlib\"\n    export LD_LIBRARY_PATH=\"$ROOT/doorstop_libs:$ROOT/linux64:${LD_LIBRARY_PATH:-}\"\n    export LD_PRELOAD=\"libdoorstop_x64.so${LD_PRELOAD:+:$LD_PRELOAD}\"\n    echo \"[launch] BepInEx enabled (built-in settings)\"\n  fi\n  export SteamAppId=892970\n  case \":${LD_LIBRARY_PATH:-}:\" in\n    *\":$ROOT/linux64:\"*|*\":./linux64:\"*) ;;\n    *) export LD_LIBRARY_PATH=\"$ROOT/linux64:${LD_LIBRARY_PATH:-}\" ;;\n  esac\n  echo \"[launch] LD_PRELOAD=$LD_PRELOAD\"\n  echo \"[launch] Plugins: $(ls BepInEx/plugins 2>/dev/null | wc -l) folder(s) in BepInEx/plugins\"\nelse\n  echo \"[launch] WARNING: BepInEx files not found, starting a VANILLA server (no mods).\"\n  echo \"[launch]   missing: $( [ -f BepInEx/core/BepInEx.Preloader.dll ] || echo -n 'BepInEx/core/BepInEx.Preloader.dll ' ) $( [ -f doorstop_libs/libdoorstop_x64.so ] || echo -n 'doorstop_libs/libdoorstop_x64.so' )\"\n  export SteamAppId=892970\n  export LD_LIBRARY_PATH=\"$ROOT/linux64:${LD_LIBRARY_PATH:-}\"\nfi\n\nPORT=\"${1:-2456}\"\nexec ./valheim_server.x86_64 -nographics -batchmode \\\n  -name \"$SRV_NAME\" -port \"$PORT\" -world \"$WORLD_NAME\" \\\n  -password \"$SRV_PASSWORD\" -public \"$SRV_PUBLIC\" -savedir ./saves\nEOF\nchmod +x \"$SERVER/start_server.sh\"\n\n## ---- 4. First sync ----\nROOT=\"$SERVER\" bash \"$SERVER/sync_mods.sh\"\n\necho \"Install complete.\"\n",
+      "container": "ghcr.io/Lilyweave/WulfNet-Panel/Docker Images/SteamCMD:Debian",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "Server Name",
+      "description": "Name shown in the server browser.",
+      "env_variable": "SRV_NAME",
+      "default_value": "Modded Valheim",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:60",
+      "field_type": "text"
+    },
+    {
+      "name": "World Name",
+      "description": "World save name (created if it doesn't exist).",
+      "env_variable": "WORLD_NAME",
+      "default_value": "Dedicated",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|alpha_num|max:40",
+      "field_type": "text"
+    },
+    {
+      "name": "Server Password",
+      "description": "Min 5 characters, and must not be contained in the server name.",
+      "env_variable": "SRV_PASSWORD",
+      "default_value": "123456",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|min:5|max:64",
+      "field_type": "text"
+    },
+    {
+      "name": "Public Server",
+      "description": "1 = listed in the server browser, 0 = join by IP only.",
+      "env_variable": "SRV_PUBLIC",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1",
+      "field_type": "text"
+    },
+    {
+      "name": "r2modman Profile Code",
+      "description": "Profile code from r2modman (Settings > Profile > Export profile as code). Change it and restart to update mods.",
+      "env_variable": "PROFILE_CODE",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:64",
+      "field_type": "text"
+    },
+    {
+      "name": "Excluded Mods",
+      "description": "Comma-separated Author-Name list to skip, e.g. client-only mods (Author-ModName,Other-Mod).",
+      "env_variable": "EXCLUDE_MODS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:1000",
+      "field_type": "text"
+    },
+    {
+      "name": "Sync Mods On Start",
+      "description": "1 = sync mods from the profile every time the server starts, 0 = only at install.",
+      "env_variable": "AUTO_UPDATE_MODS",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1",
+      "field_type": "text"
+    },
+    {
+      "name": "Use Latest Mod Versions",
+      "description": "1 = ignore the versions pinned in the profile and use each mod's newest Thunderstore release (BepInEx pack stays pinned). Clients must match!",
+      "env_variable": "LATEST_MOD_VERSIONS",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1",
+      "field_type": "text"
+    },
+    {
+      "name": "Steam App ID",
+      "description": "Valheim Dedicated Server app ID. Lets the image's built-in updater fetch/update the server at start.",
+      "env_variable": "SRCDS_APPID",
+      "default_value": "896660",
+      "user_viewable": true,
+      "user_editable": false,
+      "rules": "required|string|max:20",
+      "field_type": "text"
+    },
+    {
+      "name": "Auto Update Valheim",
+      "description": "1 = check for Valheim server updates on every start, 0 = never. Game updates can break mods, so set 0 to freeze a working setup.",
+      "env_variable": "AUTO_UPDATE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1",
+      "field_type": "text"
+    },
+    {
+      "name": "Game Modifier(s)",
+      "name_translations": {},
+      "description": "Sets chosen world modifier with value. If\ncombined with a preset should be set after. Valid\nmodifiers and values are:\n\n1. `combat: veryeasy, easy, hard, veryhard`\n\n1. `deathpenalty: casual, veryeasy, easy, hard, hardcore`\n\n1. `resources: muchless, less, more, muchmore, most`\n\n1. `raids: none, muchless, less, more, muchmore`\n\n1. `portals: casual, hard, veryhard`\n\nSyntax example: `-modifier combat easy -modifier raids none`",
+      "description_translations": {},
+      "order": 11,
+      "env_variable": "WORLD_MOD",
+      "default_value": null,
+      "user_viewable": true,
+      "user_editable": true,
+      "secret": false,
+      "rules": [
+        "string"
+      ]
+    },
+    {
+      "name": "Game Modifier(s) Checkbox Key",
+      "name_translations": {},
+      "description": "Sets a world modifier checkbox key. Valid values are:\n\n1. `nobuildcost`, `playerevents, passivemobs, nomap`\n\nSyntax example: `-setkey nobuildcost -setkey nomap`",
+      "description_translations": {},
+      "order": 11,
+      "env_variable": "WORLD_MOD_KEY",
+      "default_value": null,
+      "user_viewable": true,
+      "user_editable": true,
+      "secret": false,
+      "rules": [
+        "string"
+      ]
+    }
+  ]
+}
